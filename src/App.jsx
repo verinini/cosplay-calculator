@@ -1,4 +1,5 @@
 import React, { useReducer, useMemo, useEffect, useState, useRef } from "react";
+import { Analytics } from "@vercel/analytics/next"
 
 /* ---------------------------------------------------------
    BRAND COLORS
