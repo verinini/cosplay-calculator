@@ -1,5 +1,5 @@
 import React, { useReducer, useMemo, useEffect, useState, useRef } from "react";
-import { Analytics } from "@vercel/analytics/next"
+import { Analytics } from "@vercel/analytics/react"
 
 /* ---------------------------------------------------------
    BRAND COLORS
@@ -1335,6 +1335,7 @@ export default function CosplayPrintQuoter() {
           </p>
         </div>
       </div>
+      <Analytics />
     </div>
   );
 }
