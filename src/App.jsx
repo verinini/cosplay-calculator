@@ -44,18 +44,43 @@ const CATEGORY_PRESETS = {
   "Small Prop": { height: 10, weight: 80 },
 };
 
+// The preset weights above are PLA weights. Scale them by density so a lighter material
+// (TPU-Foam) quotes lighter and a denser one slightly heavier.
+const presetWeight = (category, material) => {
+  const preset = CATEGORY_PRESETS[category];
+  if (!preset) return 0;
+  return preset.weight * (MATERIALS[material].density / MATERIALS.PLA.density);
+};
+
 const LABOR_RATE_PER_HOUR = 40; // machine + labor, PHP
 // Paint and priming prices are placeholders, adjust to your real rates.
 const ADDON_PRICES = { priming: 250, paintFlat: 200, paintSimple: 400, paintDetailed: 800 };
+// Paint scales with weight: the paint prices above cover a piece up to this many grams, and
+// heavier pieces pay proportionally more (a 600 g piece pays 3x). Weight is measured as
+// PLA-equivalent so a foam piece, which weighs half as much for the same surface, isn't
+// undercharged. Priming is still flat.
+const PAINT_BASE_GRAMS = 200;
+// Rush applies to the print subtotal and the add-ons together.
 const RUSH_MULTIPLIER = 0.3;
 // Extra filament for supports, applied to STL/OBJ uploads only (client files have no supports).
 // G-code is already sliced, so supports are already counted and this is skipped.
 const SUPPORT_ALLOWANCE = 0.1;
+// Unit sanity check for STL/OBJ. Files are read as millimeters, so one exported in meters or
+// inches looks tiny and would quote a few grams. If the tallest piece falls outside this range
+// the volume isn't trusted and the quote asks for a typed-in weight instead.
+const SANE_TALLEST_CM = { min: 1, max: 200 };
+// Between the hard minimum and this height the quote still works, but a hint is shown. An
+// inch-unit sword (35 in) reads as 3.5 cm, which the hard minimum alone can't catch.
+const SMALL_MODEL_HINT_CM = 5;
 const PORTFOLIO_FORM_URL = "https://forms.gle/rBPCUJaH4QbmbE3A8";
 const MESSENGER_URL = "https://m.me/verakkos";
 
 const currency = (n) =>
   `\u20B1${n.toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+// Readable height for the unit warnings: tiny values keep their significant digits.
+// Plain numeric strings only, because it also feeds a type="number" input.
+const formatCm = (n) => (n < 1 ? String(Number(n.toPrecision(2))) : n.toFixed(1));
 
 /* ---------------------------------------------------------
    MESH PARSING (STL + OBJ). Pure functions, no dependencies.
@@ -110,7 +135,10 @@ function parseSTL(buffer) {
   const dv = new DataView(buffer);
   const triCountFromHeader = buffer.byteLength >= 84 ? dv.getUint32(80, true) : 0;
   const expectedBinarySize = 84 + triCountFromHeader * 50;
-  const isBinary = buffer.byteLength === expectedBinarySize && triCountFromHeader > 0;
+  // Some exporters pad the end of a binary STL, so "at least" the expected size is enough.
+  // An ASCII file can't pass this: its first bytes read as a triangle count far larger than
+  // the file could hold.
+  const isBinary = triCountFromHeader > 0 && buffer.byteLength >= expectedBinarySize;
 
   const triangles = [];
 
@@ -242,8 +270,10 @@ async function parseFile(file) {
 const initialState = {
   path: "upload", // 'upload' | 'category'
   files: [], // { id, name, size, status: 'parsing'|'done'|'error', kind, volumeCm3, dimsCm, error }
-  weightOverride: "", // '' means use the auto estimate from the files
-  heightOverride: "",
+  // null means "use the auto value from the files". An empty string means the person has
+  // cleared the box to retype, so it must not snap back to the estimate mid-edit.
+  weightOverride: null,
+  heightOverride: null,
   category: null,
   material: "PLA",
   strength: "Standard",
@@ -258,8 +288,8 @@ function reducer(state, action) {
       return {
         ...state,
         files: [...state.files, ...action.entries],
-        weightOverride: "",
-        heightOverride: "",
+        weightOverride: null,
+        heightOverride: null,
       };
     case "FILE_RESULT":
       return {
@@ -279,8 +309,8 @@ function reducer(state, action) {
       return {
         ...state,
         files: state.files.filter((f) => f.id !== action.id),
-        weightOverride: "",
-        heightOverride: "",
+        weightOverride: null,
+        heightOverride: null,
       };
     case "SET_FIELD":
       return { ...state, [action.field]: action.value };
@@ -317,6 +347,9 @@ function calculatePrice(state) {
   let gcodeGrams = 0;
   let supportGrams = 0;
   let tallestCm = 0;
+  let unitsSuspect = false;
+  let smallModelHint = false;
+  let needsManualWeight = false;
 
   if (state.path === "upload") {
     const done = state.files.filter((f) => f.status === "done");
@@ -329,15 +362,26 @@ function calculatePrice(state) {
     gcodeGrams = gcodeFiles.reduce((t, f) => t + f.volumeCm3, 0) * material.density;
     tallestCm = Math.max(0, ...meshFiles.map((f) => Math.max(f.dimsCm.x, f.dimsCm.y, f.dimsCm.z)));
 
+    unitsSuspect =
+      meshFiles.length > 0 && (tallestCm < SANE_TALLEST_CM.min || tallestCm > SANE_TALLEST_CM.max);
+    smallModelHint = meshFiles.length > 0 && !unitsSuspect && tallestCm < SMALL_MODEL_HINT_CM;
+
+    // A file with a suspicious size can't be trusted for weight, so it only quotes once a
+    // weight has been typed in.
     const meshGrams =
-      state.weightOverride !== "" ? parseFloat(state.weightOverride) || 0 : autoMeshGrams;
+      state.weightOverride !== null
+        ? parseFloat(state.weightOverride) || 0
+        : unitsSuspect
+        ? 0
+        : autoMeshGrams;
+    needsManualWeight = unitsSuspect && meshGrams <= 0;
     const meshAdj = meshGrams * strength.multiplier;
     supportGrams = meshAdj * SUPPORT_ALLOWANCE;
 
     weight = meshGrams + gcodeGrams;
     adjWeight = meshAdj + supportGrams + gcodeGrams;
   } else {
-    weight = CATEGORY_PRESETS[state.category]?.weight || 0;
+    weight = presetWeight(state.category, state.material);
     adjWeight = weight * strength.multiplier;
   }
 
@@ -346,14 +390,23 @@ function calculatePrice(state) {
   const laborCost = estHours * LABOR_RATE_PER_HOUR;
   const subtotal = materialCost + laborCost;
 
-  let addonsFlat = 0;
-  if (state.addons.priming) addonsFlat += ADDON_PRICES.priming;
-  if (state.addons.paint === "flat") addonsFlat += ADDON_PRICES.paintFlat;
-  if (state.addons.paint === "simple") addonsFlat += ADDON_PRICES.paintSimple;
-  if (state.addons.paint === "detailed") addonsFlat += ADDON_PRICES.paintDetailed;
+  // Paint price for this piece, rounded to the nearest 10 so the buttons read cleanly.
+  // Below the base weight it never drops under the listed price.
+  const paintWeightPla = (weight * MATERIALS.PLA.density) / material.density;
+  const paintScale = Math.max(1, paintWeightPla / PAINT_BASE_GRAMS);
+  const scalePaint = (base) => Math.round((base * paintScale) / 10) * 10;
+  const paintPrices = {
+    flat: scalePaint(ADDON_PRICES.paintFlat),
+    simple: scalePaint(ADDON_PRICES.paintSimple),
+    detailed: scalePaint(ADDON_PRICES.paintDetailed),
+  };
 
-  const rushSurcharge = state.addons.rush ? subtotal * RUSH_MULTIPLIER : 0;
-  const total = subtotal + addonsFlat + rushSurcharge;
+  const primingFee = state.addons.priming ? ADDON_PRICES.priming : 0;
+  const paintFee = paintPrices[state.addons.paint] || 0; // "none" has no price
+  const addonsTotal = primingFee + paintFee;
+
+  const rushSurcharge = state.addons.rush ? (subtotal + addonsTotal) * RUSH_MULTIPLIER : 0;
+  const total = subtotal + addonsTotal + rushSurcharge;
 
   return {
     weight,
@@ -362,14 +415,20 @@ function calculatePrice(state) {
     gcodeGrams,
     supportGrams,
     tallestCm,
+    unitsSuspect,
+    smallModelHint,
+    needsManualWeight,
     materialCost,
     laborCost,
     estHours,
     subtotal,
-    addonsFlat,
+    addonsTotal,
+    primingFee,
+    paintFee,
+    paintPrices,
     rushSurcharge,
     total,
-    ready: adjWeight > 0,
+    ready: adjWeight > 0 && !needsManualWeight,
   };
 }
 
@@ -498,7 +557,7 @@ export default function CosplayPrintQuoter() {
   const [isLoading, setIsLoading] = useState(true);
   const [showPromoModal, setShowPromoModal] = useState(false);
   const [showPromoBanner, setShowPromoBanner] = useState(false);
-  const [sendStatus, setSendStatus] = useState("idle"); // idle | copied
+  const [sendStatus, setSendStatus] = useState("idle"); // idle | copied | failed
 
   // Fake brand splash on first load, then trigger the promo modal once.
   useEffect(() => {
@@ -539,16 +598,30 @@ export default function CosplayPrintQuoter() {
     });
   };
 
-  const handleSendQuote = async () => {
+  const handleSendQuote = () => {
     const summary = quoteSummaryText(state, price);
+
+    // Safari and mobile browsers only allow window.open during the tap itself, so nothing
+    // here can await before it. Start the copy first (so the new tab can't steal focus from
+    // it), open Messenger straight after, then report how the copy went.
+    let copying;
     try {
-      await navigator.clipboard.writeText(summary);
-      setSendStatus("copied");
-      setTimeout(() => setSendStatus("idle"), 4000);
+      copying = navigator.clipboard.writeText(summary);
     } catch (e) {
-      // clipboard not available, still open Messenger
+      copying = Promise.reject(e); // no clipboard API in this browser
     }
     window.open(MESSENGER_URL, "_blank", "noopener,noreferrer");
+
+    const resetLater = (ms) => setTimeout(() => setSendStatus("idle"), ms);
+    copying
+      .then(() => {
+        setSendStatus("copied");
+        resetLater(4000);
+      })
+      .catch(() => {
+        setSendStatus("failed");
+        resetLater(8000);
+      });
   };
 
   if (isLoading) return <LoadingScreen />;
@@ -644,6 +717,23 @@ export default function CosplayPrintQuoter() {
                   allowance. G-code is counted as sliced (supports and infill already included).
                   Export a plain .gcode, not .gcode.3mf.
                 </p>
+                {price.unitsSuspect && (
+                  <p
+                    className="text-xs mt-2 border p-2"
+                    style={{ color: "#A13B3B", borderColor: "#A13B3B" }}
+                  >
+                    This file's size looks off: the tallest piece reads as {formatCm(price.tallestCm)} cm.
+                    That's outside the range we expect for a print, so the file may use different
+                    units (meters or inches) or include extra objects. Enter the weight in grams
+                    below to get a quote.
+                  </p>
+                )}
+                {price.smallModelHint && (
+                  <p className="text-xs mt-2" style={{ color: PLUM }}>
+                    The tallest piece is only {formatCm(price.tallestCm)} cm. If that's not right, the
+                    file may be in inches, so enter the weight yourself below.
+                  </p>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -654,16 +744,23 @@ export default function CosplayPrintQuoter() {
                     type="number"
                     min="0"
                     value={
-                      state.weightOverride !== ""
+                      state.weightOverride !== null
                         ? state.weightOverride
-                        : price.autoMeshGrams
+                        : price.autoMeshGrams && !price.unitsSuspect
                         ? price.autoMeshGrams.toFixed(0)
                         : ""
                     }
                     onChange={(e) =>
                       dispatch({ type: "SET_FIELD", field: "weightOverride", value: e.target.value })
                     }
-                    placeholder="Auto-fills from STL/OBJ files"
+                    onBlur={() => {
+                      // Left empty: go back to the auto estimate (only once they leave the box).
+                      if (state.weightOverride === "")
+                        dispatch({ type: "SET_FIELD", field: "weightOverride", value: null });
+                    }}
+                    placeholder={
+                      price.unitsSuspect ? "Enter weight in grams" : "Auto-fills from STL/OBJ files"
+                    }
                     className="w-full border p-2 text-sm"
                     style={{ borderColor: CREAM_DARK }}
                   />
@@ -674,15 +771,19 @@ export default function CosplayPrintQuoter() {
                     type="number"
                     min="0"
                     value={
-                      state.heightOverride !== ""
+                      state.heightOverride !== null
                         ? state.heightOverride
                         : price.tallestCm
-                        ? price.tallestCm.toFixed(1)
+                        ? formatCm(price.tallestCm)
                         : ""
                     }
                     onChange={(e) =>
                       dispatch({ type: "SET_FIELD", field: "heightOverride", value: e.target.value })
                     }
+                    onBlur={() => {
+                      if (state.heightOverride === "")
+                        dispatch({ type: "SET_FIELD", field: "heightOverride", value: null });
+                    }}
                     placeholder="Auto-fills from STL/OBJ files"
                     className="w-full border p-2 text-sm"
                     style={{ borderColor: CREAM_DARK }}
@@ -708,7 +809,7 @@ export default function CosplayPrintQuoter() {
                     className="text-xs mt-1"
                     style={{ color: state.category === name ? "#E6D4DF" : "#8A7A63" }}
                   >
-                    ~{preset.height}cm · ~{preset.weight}g
+                    ~{preset.height}cm · ~{Math.round(presetWeight(name, state.material))}g
                   </div>
                 </button>
               ))}
@@ -783,9 +884,9 @@ export default function CosplayPrintQuoter() {
             <div className="grid grid-cols-2 gap-2">
               {[
                 { key: "none", label: "None", blurb: "Unpainted" },
-                { key: "flat", label: `Flat (+${currency(ADDON_PRICES.paintFlat)})`, blurb: "One color only" },
-                { key: "simple", label: `Simple (+${currency(ADDON_PRICES.paintSimple)})`, blurb: "Non-detailed work" },
-                { key: "detailed", label: `Detailed (+${currency(ADDON_PRICES.paintDetailed)})`, blurb: "Intricate detail work" },
+                { key: "flat", label: `Flat (+${currency(price.paintPrices.flat)})`, blurb: "One color only" },
+                { key: "simple", label: `Simple (+${currency(price.paintPrices.simple)})`, blurb: "Non-detailed work" },
+                { key: "detailed", label: `Detailed (+${currency(price.paintPrices.detailed)})`, blurb: "Intricate detail work" },
               ].map((opt) => (
                 <button
                   key={opt.key}
@@ -814,7 +915,7 @@ export default function CosplayPrintQuoter() {
             <div className="space-y-2">
               {[
                 { key: "priming", label: `Priming, paint-ready finish (+${currency(ADDON_PRICES.priming)})` },
-                { key: "rush", label: `Rush delivery (+${RUSH_MULTIPLIER * 100}% of subtotal)` },
+                { key: "rush", label: `Rush delivery (+${RUSH_MULTIPLIER * 100}% of print and add-ons)` },
               ].map((addon) => (
                 <label key={addon.key} className="flex items-center gap-2 text-sm">
                   <input
@@ -846,27 +947,22 @@ export default function CosplayPrintQuoter() {
                 className="text-xs underline mt-2"
                 style={{ color: "#8A7A63" }}
               >
-                {showBreakdown ? "Hide" : "Show"} internal breakdown
+                {showBreakdown ? "Hide" : "Show"} price breakdown
               </button>
 
+              {/* Customer-facing: what the price is made of, without the cost inputs
+                  (material cost, labor rate, weight, print time) behind it. */}
               {showBreakdown && (
                 <div
                   className="mt-3 space-y-1 text-sm border-t pt-3"
                   style={{ color: TEXT, borderColor: CREAM_DARK }}
                 >
-                  <Row label="Weight used" value={`${price.weight.toFixed(0)}g (adj. ${price.adjWeight.toFixed(0)}g)`} />
-                  {price.supportGrams > 0 && (
-                    <Row label="Support allowance" value={`${price.supportGrams.toFixed(0)}g`} />
+                  <Row label="Print (material and machine time)" value={currency(price.subtotal)} />
+                  {price.paintFee > 0 && <Row label="Paint" value={currency(price.paintFee)} />}
+                  {price.primingFee > 0 && <Row label="Priming" value={currency(price.primingFee)} />}
+                  {price.rushSurcharge > 0 && (
+                    <Row label="Rush delivery" value={currency(price.rushSurcharge)} />
                   )}
-                  {price.gcodeGrams > 0 && (
-                    <Row label="Sliced G-code (as-is)" value={`${price.gcodeGrams.toFixed(0)}g`} />
-                  )}
-                  <Row label="Material cost" value={currency(price.materialCost)} />
-                  <Row label="Est. print time" value={`${price.estHours.toFixed(1)} hrs`} />
-                  <Row label="Labor / machine cost" value={currency(price.laborCost)} />
-                  <Row label="Subtotal" value={currency(price.subtotal)} />
-                  <Row label="Add-ons (flat)" value={currency(price.addonsFlat)} />
-                  <Row label="Rush surcharge" value={currency(price.rushSurcharge)} />
                 </div>
               )}
 
@@ -881,6 +977,12 @@ export default function CosplayPrintQuoter() {
               {sendStatus === "copied" && (
                 <p className="text-xs mt-2 text-center" style={{ color: "#4F6B4A" }}>
                   Quote copied, paste it into the Messenger chat that just opened.
+                </p>
+              )}
+              {sendStatus === "failed" && (
+                <p className="text-xs mt-2 text-center" style={{ color: "#A13B3B" }}>
+                  Couldn't copy the quote automatically. Messenger is open, so please type out
+                  your selections and the estimated total there.
                 </p>
               )}
             </>
